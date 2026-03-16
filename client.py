@@ -1,68 +1,94 @@
-import socket
+from socket import *
 import threading
 import sys
+import time
 
-HOST = "127.0.0.1"
-PORT = 9000
+SIGNAL_SERVER_HOST = "0.0.0.0"
+SIGNAL_SERVER_PORT = 9005
 
-def receive_loop(sock: socket.socket):
-    """Thread que fica ouvindo mensagens do servidor."""
-    try:
-        while True:
-            data = sock.recv(4096)
-            if not data:
-                print("\n[Conexão encerrada pelo servidor]")
-                break
-            # Imprime sem quebrar a linha que o usuário está digitando
-            print(f"\r{data.decode('utf-8').rstrip()}")
-            print("> ", end="", flush=True)
-    except (ConnectionResetError, OSError):
-        print("\n[Conexão perdida]")
-    finally:
-        sock.close()
-        # Força saída do input() na thread principal
-        import os, signal
+# Registra no servidor de inicialização e retorna a lista de peers
+def register(name, port):
+    s = socket(AF_INET, SOCK_STREAM)
+    s.connect((SIGNAL_SERVER_HOST, SIGNAL_SERVER_PORT))
+    s.sendall(f"{name}:{port}".encode())
+
+    peers_raw = s.recv(4096).decode()
+    s.close()
+
+    peers = {}
+    for entry in peers_raw.split(";"):
+        if entry:
+            n, ip, p = entry.split(":")
+            peers[n] = {"ip":ip, "port": p}
+
+    return peers
+
+def start_server(port, name):
+    s =  socket(AF_INET, SOCK_STREAM)
+    s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen()
+
+    while True:
+        conn, addr = s.accept()
+        threading.Thread(target=receive, args=(conn, addr)).start()
+
+def receive(conn, addr):
+    while True:
         try:
-            os.kill(os.getpid(), signal.SIGINT)
-        except Exception:
-            pass
-
-def send_loop(sock: socket.socket):
-    """Thread (main) que lê stdin e envia ao servidor."""
-    try:
-        while True:
-            print("> ", end="", flush=True)
-            msg = input()
-            if msg.lower() in ("/sair", "/quit", "/exit"):
-                print("Saindo...")
+            msg = conn.recv(1024).decode()
+            if not msg:
                 break
-            if msg:
-                sock.sendall((msg + "\n").encode("utf-8"))
-    except (KeyboardInterrupt, EOFError):
-        pass
-    finally:
-        sock.close()
+            print(f"\n[mensagem recebida] {msg}\nVocê: ", end="", flush=True)
+        except:
+            break
+    conn.close()
+
+def connect_peer(ip, port):
+    for i in range(100):
+        try:
+            s = socket(AF_INET, SOCK_STREAM)
+            s.connect((ip, port))
+            return s
+        except ConnectionRefusedError:
+            print(f"Tentativa {i}")
+            time.sleep(1)
+    raise ConnectionRefusedError(f"Não foi possível conectar a {ip}:{port} após {i} tentativas")
+
+def send(conn, name):
+    while True:
+        msg = input("Você: ")
+        try:
+            conn.send(f"{name}: {msg}".encode())
+        except:
+            print("Conexão perdida")
+            break
 
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else HOST
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else PORT
+    name = sys.argv[1]
+    port = int(sys.argv[2])
 
-    print(f"Conectando em {host}:{port}...")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect((host, port))
-    except ConnectionRefusedError:
-        print("Erro: não foi possível conectar. O servidor está rodando?")
-        sys.exit(1)
+    threading.Thread(target=start_server, args=(port, name), daemon=True).start()
+    print(f"[{name}] escutando na porta {port}")
 
-    print("Conectado!\n")
+    peers = register(name, port)
+    print(f"peers conhecidos: {peers}")
 
-    # Thread de recepção (daemon: morre quando o processo principal sair)
-    t = threading.Thread(target=receive_loop, args=(sock,), daemon=True)
-    t.start()
+    connections = {}
+    for peer_name, info in peers.items():
+        if peer_name != name:
+            try:
+                conn = connect_peer(info["ip"], int(info["port"])) 
+                connections[peer_name] = conn
+                print(f"Conectado diretamente a {peer_name}")
+            except Exception as e:
+                print(f"Não foi possível conectar a {peer_name}: {e}")
 
-    # Loop de envio na thread principal
-    send_loop(sock)
+    if connections:
+        target_peer = list(connections.values())[0]
+        send(target_peer, name)
+    else:
+        print("Aguardando outros peers se conectarem...")
+        threading.Event().wait()
 
-if __name__ == "__main__":
-    main()
+main()

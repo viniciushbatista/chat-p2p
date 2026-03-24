@@ -7,4 +7,4 @@ Chat p2p full-duplex feito em python para a disciplina de Redes de Computadores,
 3. Criar um protocolo de aplicação para transmissão de mensagens mais complexas (Planejando XMPP)
 4. Implementar alguma técnica de NAT traversal para permitir conectar-se com qualquer máquina.
 5. ~~Criptografar mensagens~~
-6. Implementar uma GUI
+6. ~~Implementar uma GUI~~

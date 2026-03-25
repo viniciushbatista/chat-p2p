@@ -1,150 +1,121 @@
 from socket import *
 import threading
 
+# Estrutura do dict rooms
 # rooms[room_name] = {
 #   "password": str,
-#   "peers": { name: {"ip": str, "udp_port": int, "ready": bool} }
+#   "peers": { name: {"ip": str, "tcp_port": int} }
 # }
 rooms = {}
 lock  = threading.Lock()
 
-TCP_PORT = 9005
-UDP_PORT = 9006
+PORT = 9005
 
-# Socket UDP global (usado também para notificar peers já conectados)
-udp_sock = None
+# Explicações das Requisições:
+#
+# client → server:
+#   "LIST"
+#   "CREATE|sala|senha|nome|porta_peer"
+#   "JOIN|sala|senha|nome|porta_peer"
+#   "LEAVE|sala|nome"
+#
+# server → client:
+#   "ROOMS|sala|qtd;sala|qtd"
+#   "OK|nome|ip|porta;nome|ip|porta"
+#   "ERR|motivo"
 
+# Transforma o IP em formato numérico padrão (remove os ".")
+def normalize_ip(ip):
+    return ip.split("%")[0].strip("[]")
 
-def broadcast_peers(room_name):
-    """
-    Envia a lista atualizada de peers para TODOS os membros da sala,
-    inclusive os que já estavam conectados.
-    Deve ser chamado dentro do lock.
-    """
-    peers = rooms[room_name]["peers"]
-    for peer_name, peer_info in peers.items():
-        if not peer_info["ready"]:
-            continue
-        others = ";".join(
-            f"{n}:{info['ip']}:{info['udp_port']}"
-            for n, info in peers.items()
-            if n != peer_name
-        )
-        dest = (peer_info["ip"], peer_info["udp_port"])
-        try:
-            udp_sock.sendto(f"PEERS:{others}".encode(), dest)
-        except Exception as e:
-            print(f"[UDP] Erro ao notificar {peer_name}: {e}")
-
-
-# ── Servidor TCP: criação e entrada em salas ─────────────────────────────────
-
-def handle_tcp(conn, addr):
+# Gerencia a conexão
+def handle(conn, addr):
     try:
-        data = conn.recv(4096).decode().strip()
-        parts = data.split(":")
-        if len(parts) != 5:
-            conn.sendall("ERR:formato_invalido".encode())
+        data = conn.recv(4096).decode().strip()         # Recebe a solicitação do cliente, que pode ser "LIST |...", "CREATE |...", "JOIN |..." ou "LEAVE |..."
+        parts = data.split("|")                         # Remove o "|"
+        client_ip = normalize_ip(addr[0])               # Normaliza o IP do cliente.
+
+        if data == "LIST":                              # Caso a requisição do cliente seja listar as salas:
+            with lock:                                  # Garante acesso exclusivo, para evitar race conditions
+                payload = ";".join(                     # Percorre todas as salas, conta a quantidade de peers e junta tudo em uma string.
+                    f"{name}|{len(info['peers'])}"
+                    for name, info in rooms.items()
+                )
+            conn.sendall(f"ROOMS|{payload}".encode())   # Envia a lista com salas/peers para o cliente
             return
 
-        action, room_name, password, name, udp_port_str = parts
+        if parts[0] == "LEAVE" and len(parts) == 3:     # Caso o usuário tenha escolhido sair da sala:
+            _, room_name, name = parts                  
+            with lock:                                  # Acesso exclusivo, evita race conditions
+                if room_name in rooms:                  # Verifica se a sala existe
+                    rooms[room_name]["peers"].pop(name, None) # Remove o usuário da list de peers da sala
+                    if not rooms[room_name]["peers"]:   # Se a sala estiver vazia, deleta ela.
+                        del rooms[room_name]
+            conn.sendall(b"OK|")                        # Envia um sinal "OK", informando ao cliente que o usuário foi removido
+            return
 
-        with lock:
-            if action == "CREATE":
-                if room_name in rooms:
-                    conn.sendall("ERR:sala_ja_existe".encode())
-                    return
-                rooms[room_name] = {"password": password, "peers": {}}
+        if len(parts) != 5:                             # Tratamento para requisição do cliente inválida.
+            conn.sendall(b"ERR|formato_invalido")
+            return
 
-            if action in ("CREATE", "JOIN"):
-                if room_name not in rooms:
-                    conn.sendall("ERR:sala_nao_existe".encode())
+        # Requisição, nome da sala, senha da sala, nome do cliente, porta do cliente
+        action, room_name, password, name, port_str = parts 
+
+        with lock:                                      # Garante acesso exclusivo
+            if action == "CREATE":                      # Cliente solicita a criação de uma sala:
+                if room_name in rooms:                  # Tratamento para sala já existente        
+                    conn.sendall(b"ERR|sala_ja_existe")
                     return
-                if rooms[room_name]["password"] != password:
-                    conn.sendall("ERR:senha_incorreta".encode())
+                rooms[room_name] = {"password": password, "peers": {}} # Adiciona a sala na lista de salas
+
+            if action in ("CREATE", "JOIN"):            # Entra em uma sala, tanto para o usuário que selecionou a sala quanto para o que acabou de criar.
+                if room_name not in rooms:              # Verificação de sala inexistente
+                    conn.sendall(b"ERR|sala_nao_existe")
+                    return
+                if rooms[room_name]["password"] != password: # Veficicação de senha
+                    conn.sendall(b"ERR|senha_incorreta")
                     return
 
-                rooms[room_name]["peers"][name] = {
-                    "ip":       addr[0],
-                    "udp_port": int(udp_port_str),
-                    "ready":    False,
+                rooms[room_name]["peers"][name] = {     # Atrbui o IP e Porta do usuário ao peer da sala. 
+                    "ip":       client_ip,
+                    "tcp_port": int(port_str),
                 }
 
-                peers = rooms[room_name]["peers"]
-                other_peers = ";".join(
-                    f"{n}:{info['ip']}:{info['udp_port']}"
+                peers = rooms[room_name]["peers"]       # Obtém a lista de todos os peers da sala (menos o próprio usuário)
+                others = ";".join(
+                    f"{n}|{info['ip']}|{info['tcp_port']}"
                     for n, info in peers.items()
                     if n != name
                 )
-                conn.sendall(f"OK:{other_peers}".encode())
+                conn.sendall(f"OK|{others}".encode())   # Envia um sinal "OK" para o cliente, junto com a lista de todos os PEERS daquela sala
             else:
-                conn.sendall("ERR:acao_desconhecida".encode())
+                conn.sendall(b"ERR|acao_desconhecida")
+
     except Exception as e:
-        print(f"[TCP] Erro: {e}")
+        print(f"[server] erro: {e}")
     finally:
         conn.close()
 
+# Inicialização tenta conectar IPV6, se n der certo vai IPV4
 
-# ── Servidor UDP: coordena o hole punching ────────────────────────────────────
-#
-# Correção principal: quando um novo peer envia READY, o servidor
-# notifica TODOS os peers já prontos na sala com a lista atualizada —
-# não apenas quando "todos" ficam prontos ao mesmo tempo.
-# Isso permite que um terceiro (ou quarto) peer entre depois.
+try:
+    srv = socket(AF_INET6, SOCK_STREAM)                             # Instancia um socket TCP (SOCK_STREAM) com endereçamento IPV6 (AF_INET6)
+    srv.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)                    # Define a conexão para somente IPV6
+    srv.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)                     # Avisa ao sistema operacional para reutilizar a porta, caso ela esteja no estado WAIT                  
+    srv.bind(("", PORT))                                            # Atribui o servidor à porta 9005 
+    print(f"[server] dual-stack (IPv4+IPv6) na porta {PORT}")
+except OSError:                                                     # Em caso de erro, testa a criação do socket com IPV4
+    srv = socket(AF_INET, SOCK_STREAM)                              # Instancia um socket TCP (SOCK_STREAM) com endereçamento IPV4 (AF_INET)
+    srv.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)                     # Avisa ao sistema operacional para reutilizar a porta, caso ela esteja no estado WAIT
+    srv.bind(("0.0.0.0", PORT))                                     # Atribui a variável "PORT" (9005) como porta da conexão
+    print(f"[server] IPv4 na porta {PORT}")                 
 
-def udp_server():
-    global udp_sock
-    udp_sock = socket(AF_INET, SOCK_DGRAM)
-    udp_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    udp_sock.bind(("0.0.0.0", UDP_PORT))
-    print(f"[UDP] Escutando na porta {UDP_PORT}...")
-
-    while True:
-        try:
-            data, addr = udp_sock.recvfrom(1024)
-            msg = data.decode().strip()
-
-            if not msg.startswith("READY:"):
-                continue
-
-            parts = msg.split(":", 2)
-            if len(parts) != 3:
-                continue
-            _, room_name, name = parts
-
-            with lock:
-                if room_name not in rooms or name not in rooms[room_name]["peers"]:
-                    continue
-
-                peer = rooms[room_name]["peers"][name]
-                peer["ip"]       = addr[0]
-                peer["udp_port"] = addr[1]
-                peer["ready"]    = True
-
-                ready_peers = {
-                    n: info for n, info in rooms[room_name]["peers"].items()
-                    if info["ready"]
-                }
-
-                # Só dispara se há pelo menos 2 peers prontos
-                if len(ready_peers) >= 2:
-                    broadcast_peers(room_name)
-                    print(f"[UDP] Lista enviada para {list(ready_peers.keys())} — sala '{room_name}'")
-
-        except Exception as e:
-            print(f"[UDP] Erro: {e}")
-
-
-# ── Inicialização ─────────────────────────────────────────────────────────────
-
-threading.Thread(target=udp_server, daemon=True).start()
-
-tcp_server = socket(AF_INET, SOCK_STREAM)
-tcp_server.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-tcp_server.bind(("0.0.0.0", TCP_PORT))
-tcp_server.listen()
-print(f"[TCP] Servidor de sinalização escutando na porta {TCP_PORT}...")
+srv.listen()                                                        # Escuta requisições no endereço local e na porta "PORT" (9005)
 
 while True:
-    conn, addr = tcp_server.accept()
-    threading.Thread(target=handle_tcp, args=(conn, addr), daemon=True).start()
+    conn, addr = srv.accept()                                       # Aceita a conexão (conn = objeto socket; addr = {host, porta, flowinfo, scope_id})
+    #Cria uma thread para receber conexões e enviar para handle
+    #handle = função que será executda concorrentemente
+    #"args = (conn, addr)" = argumentos da função handle
+    #"daemon = trua" = Garante que ao fechar o programa todas as threads de atendimento sejam encerradas também. 
+    threading.Thread(target=handle, args=(conn, addr), daemon=True).start() 

@@ -1,425 +1,718 @@
 import tkinter as tk
-from tkinter import scrolledtext
-from socket import *
+from tkinter import messagebox, simpledialog
 import threading
+import socket
 import time
-import json
 import os
-
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-SIGNAL_HOST     = "127.0.0.1"
-SIGNAL_TCP_PORT = 9005
-SIGNAL_UDP_PORT = 9006
-HOLE_PUNCH_ATTEMPTS = 10
-HOLE_PUNCH_INTERVAL = 0.1
+# Paleta do Tkinter
+BG       = "#0f1117"
+BG2      = "#1a1d27"
+BG3      = "#252836"
+ACCENT   = "#7c6af7"
+ACCENT2  = "#5c4fd6"
+FG       = "#e8e8f0"
+FG2      = "#9090a8"
+SUCCESS  = "#4caf82"
+DANGER   = "#e05c5c"
+BORDER   = "#2e3148"
 
-BG      = "#1e1e2e"
-BG2     = "#2a2a3e"
-BG3     = "#313147"
-ACCENT  = "#7c6af7"
-ACCENT2 = "#5a4ed1"
-GREEN   = "#50fa7b"
-TEXT    = "#cdd6f4"
-TEXT2   = "#a6adc8"
+FONT_MONO = ("Courier", 10)
+FONT_UI   = ("Helvetica", 10)
+FONT_BIG  = ("Helvetica", 16, "bold")
+FONT_MED  = ("Helvetica", 11, "bold")
 
-def generate_keypair():
-    priv = X25519PrivateKey.generate()
-    pub  = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    return priv, pub
+PEER_PORT = 9100                    # porta base do listener, incrementada se ocupada
 
-def derive_shared_key(private_key, peer_pub_bytes):
-    peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
-    secret   = private_key.exchange(peer_pub)
-    return HKDF(algorithm=hashes.SHA256(), length=32,
-                salt=None, info=b"p2p-chat-v1").derive(secret)
+SALT = b"p2p-chat-salt-2025"         # fixo para todos os peers derivarem a mesma chave
 
-def encrypt_message(key, plaintext):
-    nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, plaintext.encode(), None)
+# Criptografia (Retirado de um exemplo no site da biblioteca cryptography)
+# Gera uma chave usando o algoritmo PBKDF2HMAC
+def derive_key(password: str) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,          # Tamanho da senha
+        salt=SALT,
+        iterations=200_000, # Executa a função de criptografia por 200k iterações
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
-def decrypt_message(key, data):
-    return AESGCM(key).decrypt(data[:12], data[12:], None).decode()
+# Criptografa a senha após criar um objeto fernet usando a chave derivada na função derive_key.
+def encrypt(fernet: Fernet, text: str) -> bytes:
+    return fernet.encrypt(text.encode())
 
-def tcp_register(action, room, password, name, udp_port):
-    s = socket(AF_INET, SOCK_STREAM)
-    s.connect((SIGNAL_HOST, SIGNAL_TCP_PORT))
-    s.sendall(f"{action}:{room}:{password}:{name}:{udp_port}".encode())
-    resp = s.recv(4096).decode()
-    s.close()
-    if resp.startswith("ERR:"):
-        raise RuntimeError({
-            "sala_ja_existe":  "Sala já existe. Use 'Entrar'.",
-            "sala_nao_existe": "Sala não encontrada. Crie-a primeiro.",
-            "senha_incorreta": "Senha incorreta.",
-        }.get(resp.split(":", 1)[1], resp))
-    peers = {}
-    for e in resp[len("OK:"):].split(";"):
-        if e:
-            n, ip, p = e.split(":")
-            peers[n] = (ip, int(p))
-    return peers
+# Decifra uma mensagem criptografada, utilizando a mensagem e o mesmo objeto fernet utilizado na criptografia.
+def decrypt(fernet: Fernet, token: bytes) -> str:
+    return fernet.decrypt(token).decode()
 
-def udp_wait_peers(sock, room, name):
-    sock.sendto(f"READY:{room}:{name}".encode(), (SIGNAL_HOST, SIGNAL_UDP_PORT))
-    sock.settimeout(60)
-    while True:
-        data, _ = sock.recvfrom(4096)
-        msg = data.decode()
-        if msg.startswith("PEERS:"):
-            peers = {}
-            for e in msg[len("PEERS:"):].split(";"):
-                if e:
-                    n, ip, p = e.split(":")
-                    peers[n] = (ip, int(p))
-            return peers
-
-def do_punch(sock, targets):
-    for _ in range(HOLE_PUNCH_ATTEMPTS):
-        for ip, port in targets:
-            try: sock.sendto(b"PUNCH", (ip, port))
+# Comunicação com servidor de sinalização
+# Realiza a conexão com o servidor de sinalização, conforma o IP fornecido pelo usuário e a porta 9005 (padrão)
+def tcp_connect(host: str, port: int, timeout: float = 5) -> socket.socket:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM) # Obtém todos os endereços TCP possíveis
+    last_err = Exception("sem endereço resolvido")
+    for af, socktype, proto, canonname, sockaddr in infos:
+        try:
+            s = socket.socket(af, socktype, proto)
+            s.settimeout(timeout)
+            s.connect(sockaddr)
+            return s
+        except OSError as e:
+            last_err = e
+            try: s.close()
             except: pass
-        time.sleep(HOLE_PUNCH_INTERVAL)
+    raise last_err
 
-def send_pubkey(sock, my_name, my_pub, targets):
-    payload = f"PUBKEY:{my_name}:{my_pub.hex()}".encode()
-    for ip, port in targets:
-        try: sock.sendto(payload, (ip, port))
-        except: pass
+# Envia e aguarda resposta de uma requisição para o servidor de sinalização 
+def sig_send(server_ip: str, server_port: int, message: str) -> str:
+    with tcp_connect(server_ip, server_port) as s:
+        s.sendall(message.encode())
+        return s.recv(4096).decode().strip()
 
+# Listener P2P (usuário)
+class PeerListener:
+    def __init__(self, port: int, fernet: Fernet, on_message):
+        self.port       = port
+        self.fernet     = fernet
+        self.on_message = on_message
+        self._stop      = threading.Event()
+        self._srv       = None
 
-class ChatApp(tk.Tk):
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._srv:
+            try: self._srv.close()
+            except: pass
+
+    def _run(self):
+        try:
+            self._srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            self._srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._srv.bind(("", self.port))
+        except OSError:
+            self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._srv.bind(("0.0.0.0", self.port))
+        self._srv.listen()
+        self._srv.settimeout(1)
+        while not self._stop.is_set():
+            try:
+                conn, addr = self._srv.accept()
+                threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except: break
+
+    def _handle(self, conn, addr):
+        try:
+            data = conn.recv(8192)
+            if data:
+                print(f"\n[TESTE CRIPTOGRAFIA - ENTRADA]") #teste criptografia
+                print(f"Dados brutos recebidos: {data}")#teste criptografia
+
+                text = decrypt(self.fernet, data)
+
+                print(f"Texto após Descriptografar: {text}")#teste criptografia
+                print("-" * 30)#teste criptografia
+
+                self.on_message(text)
+        except Exception as e:
+            self.on_message(f"[erro ao receber mensagem: {e}]")
+        finally:
+            conn.close()
+
+# Broadcast P2P
+
+def broadcast(peers: dict, fernet: Fernet, text: str, my_name: str):
+    token = encrypt(fernet, text)
+
+    print("\n[TESTE CRIPTOGRAFIA - SAÍDA]") #teste criptografia
+    print(f"Mensagem Original: {text}") #teste criptografia
+    print(f"Mensagem Criptografada (Bytes): {token}") #teste criptografia
+    print("-" * 30) #teste criptografia
+
+    for name, info in list(peers.items()):
+        if name == my_name:
+            continue
+        try:
+            with tcp_connect(info["ip"], info["tcp_port"], timeout=3) as s:
+                s.sendall(token)
+        except Exception as e:
+            print(f"[broadcast] falha ao enviar para {name}: {e}")
+
+# ── Helpers de widget ──────────────────────────────────────────────────────────
+
+def styled_entry(parent, **kwargs):
+    e = tk.Entry(
+        parent,
+        bg=BG3, fg=FG, insertbackground=FG,
+        relief="flat", bd=0,
+        font=FONT_UI,
+        highlightthickness=1,
+        highlightcolor=ACCENT,
+        highlightbackground=BORDER,
+        **kwargs
+    )
+    return e
+
+def styled_button(parent, text, command, color=ACCENT, fg=FG, **kwargs):
+    b = tk.Button(
+        parent, text=text, command=command,
+        bg=color, fg=fg,
+        activebackground=ACCENT2, activeforeground=FG,
+        relief="flat", bd=0, cursor="hand2",
+        font=("Helvetica", 10, "bold"),
+        padx=16, pady=8,
+        **kwargs
+    )
+    return b
+
+def label(parent, text, font=FONT_UI, fg=FG, **kwargs):
+    return tk.Label(parent, text=text, bg=BG, fg=fg, font=font, **kwargs)
+
+def frame(parent, bg=BG, **kwargs):
+    return tk.Frame(parent, bg=bg, **kwargs)
+
+# Telas
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("P2P Chat · E2E Criptografado")
-        self.geometry("820x580")
-        self.minsize(680, 460)
+        self.title("P2P Chat")
+        self.geometry("520x420")
+        self.resizable(False, False)
         self.configure(bg=BG)
-        self.resizable(True, True)
+        self._center()
 
-        self.udp_sock  = None
-        self.peers     = {}
-        self.peer_aes  = {}
-        self.my_name   = ""
-        self.my_pub    = None
-        self.priv_key  = None
-        self._peer_rows = {}
+        # estado compartilhado
+        self.server_ip    = ""
+        self.server_port  = 9005
+        self.my_name      = ""
+        self.my_port      = PEER_PORT
+        self.room_name    = ""
+        self.room_password= ""
+        self.fernet       = None
+        self.peers        = {}      # {name: {ip, tcp_port}}
+        self.listener     = None
+        self._poll_active = False   # controla polling de peers
 
-        self._show_login()
+        self._current_frame = None
+        self.show_connect()
 
-    # ── Login ─────────────────────────────────────────────────────────────────
+    def _center(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
-    def _show_login(self):
-        self.login_frame = tk.Frame(self, bg=BG)
-        self.login_frame.place(relx=.5, rely=.5, anchor="center")
+    def _switch(self, new_frame):
+        if self._current_frame:
+            self._current_frame.destroy()
+        self._current_frame = new_frame
+        new_frame.pack(fill="both", expand=True)
 
-        tk.Label(self.login_frame, text="🔒  P2P Chat",
-                 font=("Helvetica", 22, "bold"), bg=BG, fg=ACCENT
-                 ).grid(row=0, column=0, columnspan=2, pady=(0, 6))
-        tk.Label(self.login_frame, text="Criptografia E2E · X25519 + AES-256-GCM",
-                 font=("Helvetica", 9), bg=BG, fg=TEXT2
-                 ).grid(row=1, column=0, columnspan=2, pady=(0, 20))
+    # Tela 1: conexão
 
-        self._vars = {}
-        for i, (label, key) in enumerate([("Seu nome", "name"), ("Porta UDP", "port"),
-                                           ("Nome da sala", "room"), ("Senha", "pwd")]):
-            tk.Label(self.login_frame, text=label, bg=BG, fg=TEXT2,
-                     font=("Helvetica", 10)
-                     ).grid(row=i+2, column=0, sticky="e", padx=(0, 10), pady=5)
-            v = tk.StringVar()
-            self._vars[key] = v
-            tk.Entry(self.login_frame, textvariable=v,
-                     show="*" if key == "pwd" else "",
-                     bg=BG3, fg=TEXT, insertbackground=TEXT,
-                     relief="flat", font=("Helvetica", 11), width=22,
-                     highlightthickness=1, highlightcolor=ACCENT,
-                     highlightbackground=BG2
-                     ).grid(row=i+2, column=1, pady=5, ipady=4)
-        self._vars["port"].set("5001")
+    def show_connect(self):
+        f = frame(self)
 
-        btn_frame = tk.Frame(self.login_frame, bg=BG)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=20)
-        tk.Button(btn_frame, text="Criar sala", width=12,
-                  bg=ACCENT, fg="white", relief="flat", cursor="hand2",
-                  font=("Helvetica", 10, "bold"), activebackground=ACCENT2,
-                  command=lambda: self._connect("CREATE")
-                  ).pack(side="left", padx=6, ipady=6)
-        tk.Button(btn_frame, text="Entrar na sala", width=12,
-                  bg=BG3, fg=TEXT, relief="flat", cursor="hand2",
-                  font=("Helvetica", 10), activebackground=BG2,
-                  command=lambda: self._connect("JOIN")
-                  ).pack(side="left", padx=6, ipady=6)
+        # logo
+        tk.Label(f, text="◈ p2p chat", bg=BG, fg=ACCENT,
+                 font=("Courier", 22, "bold")).pack(pady=(48, 4))
+        tk.Label(f, text="servidor de sinalização", bg=BG, fg=FG2,
+                 font=("Courier", 9)).pack(pady=(0, 32))
 
-        self._status_var = tk.StringVar(value="")
-        tk.Label(self.login_frame, textvariable=self._status_var,
-                 bg=BG, fg=TEXT2, font=("Helvetica", 9), wraplength=320
-                 ).grid(row=8, column=0, columnspan=2)
+        inner = frame(f, bg=BG2)
+        inner.pack(padx=60, fill="x")
+        inner.configure(highlightthickness=1, highlightbackground=BORDER)
 
-    def _connect(self, action):
-        name     = self._vars["name"].get().strip()
-        room     = self._vars["room"].get().strip()
-        pwd      = self._vars["pwd"].get().strip()
-        port_str = self._vars["port"].get().strip()
-        if not all([name, room, pwd, port_str]):
-            self._status_var.set("⚠ Preencha todos os campos.")
+        pad = frame(inner, bg=BG2)
+        pad.pack(padx=20, pady=20, fill="x")
+
+        tk.Label(pad, text="IP do servidor", bg=BG2, fg=FG2,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        ip_var = tk.StringVar(value="127.0.0.1")
+        ip_e = styled_entry(pad, textvariable=ip_var)
+        ip_e.pack(fill="x", pady=(2, 12), ipady=6)
+
+        tk.Label(pad, text="Seu nome", bg=BG2, fg=FG2,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        name_var = tk.StringVar()
+        name_e = styled_entry(pad, textvariable=name_var)
+        name_e.pack(fill="x", pady=(2, 16), ipady=6)
+
+        status_lbl = tk.Label(pad, text="", bg=BG2, fg=DANGER, font=("Helvetica", 9))
+        status_lbl.pack()
+
+        def connect():
+            ip   = ip_var.get().strip()
+            name = name_var.get().strip()
+            if not ip or not name:
+                status_lbl.config(text="Preencha todos os campos.")
+                return
+            status_lbl.config(text="Conectando...", fg=FG2)
+            self.update()
+            try:
+                resp = sig_send(ip, self.server_port, "LIST")
+            except Exception as e:
+                status_lbl.config(text=f"Erro: {e}", fg=DANGER)
+                return
+            self.server_ip = ip
+            self.my_name   = name
+            status_lbl.config(text="OK!", fg=SUCCESS)
+            self.after(300, lambda: self.show_lobby(resp))
+
+        btn = styled_button(pad, "Conectar →", connect)
+        btn.pack(fill="x", pady=(8, 0))
+
+        ip_e.bind("<Return>", lambda e: name_e.focus())
+        name_e.bind("<Return>", lambda e: connect())
+
+        self._switch(f)
+        ip_e.focus()
+
+    # Tela 2: lobby
+
+    def show_lobby(self, rooms_resp=""):
+        self.geometry("680x500")
+        self._center()
+        f = frame(self)
+
+        # cabeçalho
+        hdr = frame(f, bg=BG2)
+        hdr.pack(fill="x")
+        hdr.configure(highlightthickness=1, highlightbackground=BORDER)
+        hdr_pad = frame(hdr, bg=BG2)
+        hdr_pad.pack(padx=20, pady=12, fill="x", side="left")
+        tk.Label(hdr_pad, text="◈ p2p chat", bg=BG2, fg=ACCENT,
+                 font=("Courier", 13, "bold")).pack(side="left")
+        tk.Label(hdr_pad, text=f"  —  {self.my_name}", bg=BG2, fg=FG2,
+                 font=("Courier", 10)).pack(side="left")
+
+        btn_new = styled_button(hdr, "＋ Nova sala", self._create_room_dialog,
+                                color=BG3)
+        btn_new.pack(side="right", padx=16, pady=10)
+
+        btn_ref = styled_button(hdr, "↺", self._refresh_lobby, color=BG3, width=3)
+        btn_ref.pack(side="right", pady=10)
+
+        # lista
+        body = frame(f)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        tk.Label(body, text="SALAS DISPONÍVEIS", bg=BG, fg=FG2,
+                 font=("Courier", 8)).pack(anchor="w", pady=(0, 8))
+
+        list_frame = frame(body, bg=BG2)
+        list_frame.pack(fill="both", expand=True)
+        list_frame.configure(highlightthickness=1, highlightbackground=BORDER)
+
+        canvas = tk.Canvas(list_frame, bg=BG2, bd=0, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical",
+                                 command=canvas.yview, bg=BG3)
+        inner = frame(canvas, bg=BG2)
+
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self._lobby_inner  = inner
+        self._lobby_canvas = canvas
+        self._lobby_frame  = f
+
+        self._populate_rooms(inner, rooms_resp)
+        self._switch(f)
+
+    def _populate_rooms(self, inner, rooms_resp):
+        for w in inner.winfo_children():
+            w.destroy()
+
+        # parse "ROOMS|sala|qtd;sala|qtd"
+        rooms = []
+        if rooms_resp.startswith("ROOMS|"):
+            payload = rooms_resp[6:]
+            if payload:
+                for entry in payload.split(";"):
+                    parts = entry.split("|")
+                    if len(parts) == 2:
+                        rooms.append((parts[0], parts[1]))
+
+        if not rooms:
+            tk.Label(inner, text="\nNenhuma sala disponível.\nCrie uma nova!",
+                     bg=BG2, fg=FG2, font=FONT_UI).pack(pady=20)
             return
+
+        for name, count in rooms:
+            row = frame(inner, bg=BG2)
+            row.pack(fill="x", padx=0)
+            row.configure(highlightthickness=0)
+
+            sep = frame(inner, bg=BORDER, height=1)
+            sep.pack(fill="x")
+
+            def make_enter(n=name):
+                return lambda e=None: self._join_room_dialog(n)
+
+            row_btn = tk.Button(
+                row, text=f"  {name}",
+                anchor="w",
+                bg=BG2, fg=FG,
+                activebackground=BG3, activeforeground=ACCENT,
+                relief="flat", bd=0, cursor="hand2",
+                font=("Helvetica", 11),
+                padx=8, pady=14,
+                command=make_enter(name)
+            )
+            row_btn.pack(side="left", fill="x", expand=True)
+
+            tk.Label(row, text=f"{count} peer(s)  ›",
+                     bg=BG2, fg=FG2, font=("Courier", 9)).pack(side="right", padx=16)
+
+    def _refresh_lobby(self):
         try:
-            port = int(port_str)
-        except ValueError:
-            self._status_var.set("⚠ Porta inválida.")
-            return
-        self.my_name = name
-        self._set_status("Conectando…")
-        threading.Thread(target=self._bg_connect,
-                         args=(action, name, room, pwd, port), daemon=True).start()
-
-    def _bg_connect(self, action, name, room, pwd, port):
-        try:
-            self._set_status("Gerando chaves criptográficas…")
-            self.priv_key, self.my_pub = generate_keypair()
-
-            self._set_status("Abrindo socket UDP…")
-            self.udp_sock = socket(AF_INET, SOCK_DGRAM)
-            self.udp_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-            self.udp_sock.bind(("0.0.0.0", port))
-
-            self._set_status("Registrando no servidor…")
-            tcp_register(action, room, pwd, name, port)
-
-            self._set_status("Aguardando peers…")
-            peers = udp_wait_peers(self.udp_sock, room, name)
-            self.peers = peers
-
-            self._set_status("Realizando hole punch…")
-            threading.Thread(target=do_punch,
-                             args=(self.udp_sock, list(peers.values())),
-                             daemon=True).start()
-            time.sleep(HOLE_PUNCH_ATTEMPTS * HOLE_PUNCH_INTERVAL + 0.5)
-
-            # Envia a chave pública para quem já está na sala.
-            # Quem entrar depois será tratado no _receive_loop.
-            if peers:
-                send_pubkey(self.udp_sock, name, self.my_pub, list(peers.values()))
-
-            # Abre o chat sem esperar as respostas — a troca termina de forma assíncrona
-            self.after(0, self._show_chat, room)
-
+            resp = sig_send(self.server_ip, self.server_port, "LIST")
         except Exception as e:
-            self.after(0, lambda err=e: self._set_status(f"Erro: {err}"))
+            messagebox.showerror("Erro", str(e))
+            return
+        self._populate_rooms(self._lobby_inner, resp)
 
-    def _set_status(self, msg):
-        self.after(0, lambda m=msg: self._status_var.set(m))
+    def _create_room_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Nova sala")
+        dlg.configure(bg=BG)
+        dlg.geometry("340x240")
+        dlg.resizable(False, False)
+        dlg.grab_set()
 
-    # ── Chat ──────────────────────────────────────────────────────────────────
+        pad = frame(dlg)
+        pad.pack(padx=24, pady=24, fill="both")
 
-    def _show_chat(self, room):
-        self.login_frame.destroy()
-        self.title(f"P2P Chat · {room}")
+        tk.Label(pad, text="Nova sala", bg=BG, fg=ACCENT,
+                 font=FONT_BIG).pack(anchor="w", pady=(0, 16))
 
-        main = tk.Frame(self, bg=BG)
-        main.pack(fill="both", expand=True)
+        tk.Label(pad, text="Nome da sala", bg=BG, fg=FG2,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        rname = styled_entry(pad)
+        rname.pack(fill="x", pady=(2, 10), ipady=6)
 
-        sidebar = tk.Frame(main, bg=BG2, width=180)
-        sidebar.pack(side="left", fill="y")
+        tk.Label(pad, text="Senha", bg=BG, fg=FG2,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        rpwd = styled_entry(pad, show="●")
+        rpwd.pack(fill="x", pady=(2, 16), ipady=6)
+
+        err_lbl = tk.Label(pad, text="", bg=BG, fg=DANGER, font=("Helvetica", 9))
+        err_lbl.pack()
+
+        def create():
+            n = rname.get().strip()
+            p = rpwd.get().strip()
+            if not n or not p:
+                err_lbl.config(text="Preencha tudo.")
+                return
+            port = self._find_free_port()
+            msg  = f"CREATE|{n}|{p}|{self.my_name}|{port}"
+            try:
+                resp = sig_send(self.server_ip, self.server_port, msg)
+            except Exception as e:
+                err_lbl.config(text=str(e))
+                return
+            if resp.startswith("ERR"):
+                err_lbl.config(text=resp)
+                return
+            dlg.destroy()
+            self._enter_room(n, p, port, resp)
+
+        styled_button(pad, "Criar ›", create).pack(fill="x")
+        rname.focus()
+        rname.bind("<Return>", lambda e: rpwd.focus())
+        rpwd.bind("<Return>", lambda e: create())
+
+    def _join_room_dialog(self, room_name):
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Entrar — {room_name}")
+        dlg.configure(bg=BG)
+        dlg.geometry("320x190")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        pad = frame(dlg)
+        pad.pack(padx=24, pady=24, fill="both")
+
+        tk.Label(pad, text=f"Entrar em «{room_name}»", bg=BG, fg=FG,
+                 font=FONT_MED).pack(anchor="w", pady=(0, 12))
+
+        tk.Label(pad, text="Senha", bg=BG, fg=FG2,
+                 font=("Helvetica", 9)).pack(anchor="w")
+        pwd_e = styled_entry(pad, show="●")
+        pwd_e.pack(fill="x", pady=(2, 12), ipady=6)
+
+        err_lbl = tk.Label(pad, text="", bg=BG, fg=DANGER, font=("Helvetica", 9))
+        err_lbl.pack()
+
+        def join():
+            p = pwd_e.get().strip()
+            if not p:
+                err_lbl.config(text="Digite a senha.")
+                return
+            port = self._find_free_port()
+            msg  = f"JOIN|{room_name}|{p}|{self.my_name}|{port}"
+            try:
+                resp = sig_send(self.server_ip, self.server_port, msg)
+            except Exception as e:
+                err_lbl.config(text=str(e))
+                return
+            if resp.startswith("ERR"):
+                err_lbl.config(text=resp)
+                return
+            dlg.destroy()
+            self._enter_room(room_name, p, port, resp)
+
+        styled_button(pad, "Entrar ›", join).pack(fill="x")
+        pwd_e.focus()
+        pwd_e.bind("<Return>", lambda e: join())
+
+    def _find_free_port(self):
+        port = PEER_PORT
+        while True:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("0.0.0.0", port))
+                    return port
+                except OSError:
+                    port += 1
+
+    def _enter_room(self, room_name, password, my_port, server_resp):
+        self.room_name    = room_name
+        self.room_password= password
+        self.my_port      = my_port
+        self.fernet       = Fernet(derive_key(password))
+
+        # parse peers existentes: "OK|nome|ip|porta;nome|ip|porta"
+        self.peers = {}
+        if server_resp.startswith("OK|"):
+            payload = server_resp[3:]
+            if payload:
+                for entry in payload.split(";"):
+                    parts = entry.split("|")
+                    if len(parts) == 3:
+                        self.peers[parts[0]] = {
+                            "ip": parts[1],
+                            "tcp_port": int(parts[2])
+                        }
+
+        # inicia listener
+        if self.listener:
+            self.listener.stop()
+        self.listener = PeerListener(my_port, self.fernet, self._on_peer_message)
+        self.listener.start()
+
+        # inicia polling de peers
+        self._poll_active = True
+        threading.Thread(target=self._poll_peers_loop, daemon=True).start()
+
+        self.show_chat()
+
+    def _poll_peers_loop(self):
+        """Reinscreve na sala a cada 5s para descobrir novos peers."""
+        while self._poll_active:
+            time.sleep(5)
+            if not self._poll_active:
+                break
+            try:
+                msg  = f"JOIN|{self.room_name}|{self.room_password}|{self.my_name}|{self.my_port}"
+                resp = sig_send(self.server_ip, self.server_port, msg)
+                if resp.startswith("OK|"):
+                    new_peers = {}
+                    payload = resp[3:]
+                    if payload:
+                        for entry in payload.split(";"):
+                            parts = entry.split("|")
+                            if len(parts) == 3:
+                                new_peers[parts[0]] = {
+                                    "ip": parts[1],
+                                    "tcp_port": int(parts[2])
+                                }
+                    # detecta entradas e saídas
+                    joined = set(new_peers) - set(self.peers)
+                    left   = set(self.peers) - set(new_peers)
+                    self.peers = new_peers
+                    if joined or left:
+                        def update(j=joined, l=left):
+                            for name in j:
+                                self._system_msg(f"{name} entrou na sala.")
+                            for name in l:
+                                self._system_msg(f"{name} saiu da sala.")
+                            self._refresh_peers_sidebar()
+                        self.after(0, update)
+            except Exception as e:
+                print(f"[poll] erro: {e}")
+
+    # Tela 3: chat
+
+    def show_chat(self):
+        self.geometry("860x560")
+        self._center()
+        self.resizable(True, True)
+        f = frame(self)
+
+        # cabeçalho
+        hdr = frame(f, bg=BG2)
+        hdr.pack(fill="x")
+        hdr.configure(highlightthickness=1, highlightbackground=BORDER)
+
+        hdr_l = frame(hdr, bg=BG2)
+        hdr_l.pack(side="left", padx=16, pady=10)
+        tk.Label(hdr_l, text="◈", bg=BG2, fg=ACCENT,
+                 font=("Courier", 14, "bold")).pack(side="left")
+        tk.Label(hdr_l, text=f"  {self.room_name}", bg=BG2, fg=FG,
+                 font=("Helvetica", 12, "bold")).pack(side="left")
+        tk.Label(hdr_l, text=f"  —  {self.my_name}", bg=BG2, fg=FG2,
+                 font=("Courier", 9)).pack(side="left")
+
+        def leave():
+            self._poll_active = False
+            if self.listener:
+                self.listener.stop()
+            try:
+                sig_send(self.server_ip, self.server_port,
+                         f"LEAVE|{self.room_name}|{self.my_name}")
+            except: pass
+            self.peers    = {}
+            self.fernet   = None
+            self.listener = None
+            self.resizable(False, False)
+            self.geometry("520x420")
+            self._center()
+            self.show_connect()
+
+        styled_button(hdr, "Sair", leave, color=DANGER).pack(side="right", padx=16, pady=8)
+
+        # body
+        body = frame(f)
+        body.pack(fill="both", expand=True)
+
+        # sidebar peers
+        sidebar = frame(body, bg=BG2, width=160)
+        sidebar.pack(side="right", fill="y")
         sidebar.pack_propagate(False)
+        sidebar.configure(highlightthickness=1, highlightbackground=BORDER)
 
-        tk.Label(sidebar, text="Sala", bg=BG2, fg=TEXT2,
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(14, 2))
-        tk.Label(sidebar, text=f"  {room}", bg=BG2, fg=TEXT,
-                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=12)
-        tk.Frame(sidebar, bg=BG3, height=1).pack(fill="x", padx=12, pady=10)
-        tk.Label(sidebar, text="Peers conectados", bg=BG2, fg=TEXT2,
-                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(0, 6))
+        tk.Label(sidebar, text="PEERS", bg=BG2, fg=FG2,
+                 font=("Courier", 8)).pack(pady=(12, 6))
 
-        self.peers_frame = tk.Frame(sidebar, bg=BG2)
-        self.peers_frame.pack(fill="x", padx=8)
+        self._peers_frame = frame(sidebar, bg=BG2)
+        self._peers_frame.pack(fill="x", padx=8)
 
-        self._add_peer_row(self.my_name, is_me=True)
-        for pname in self.peers:
-            self._add_peer_row(pname)
-
-        tk.Frame(sidebar, bg=BG3, height=1).pack(fill="x", padx=12, pady=10)
-        tk.Label(sidebar, text="🔒 E2E Ativo\nX25519 + AES-256-GCM",
-                 bg=BG2, fg=GREEN, font=("Helvetica", 9), justify="left"
-                 ).pack(anchor="w", padx=14, pady=(0, 12))
-
-        chat_area = tk.Frame(main, bg=BG)
+        # área de mensagens
+        chat_area = frame(body, bg=BG)
         chat_area.pack(side="left", fill="both", expand=True)
 
-        header = tk.Frame(chat_area, bg=BG2, height=48)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text=f"#{room}", bg=BG2, fg=TEXT,
-                 font=("Helvetica", 13, "bold")).pack(side="left", padx=16, pady=12)
-        tk.Label(header, text=f"Você: {self.my_name}", bg=BG2, fg=TEXT2,
-                 font=("Helvetica", 9)).pack(side="right", padx=16)
+        self._chat_text = tk.Text(
+            chat_area,
+            bg=BG, fg=FG,
+            font=FONT_MONO,
+            relief="flat", bd=0,
+            state="disabled",
+            wrap="word",
+            padx=16, pady=12,
+            spacing2=4,
+            highlightthickness=0,
+            selectbackground=BG3,
+        )
+        self._chat_text.pack(fill="both", expand=True)
 
-        self.chat_box = scrolledtext.ScrolledText(
-            chat_area, state="disabled", wrap="word",
-            bg=BG, fg=TEXT, font=("Helvetica", 11),
-            relief="flat", padx=16, pady=12, selectbackground=ACCENT2)
-        self.chat_box.pack(fill="both", expand=True)
-        self.chat_box.tag_config("me",        foreground=TEXT,   justify="right")
-        self.chat_box.tag_config("me_name",   foreground=ACCENT, justify="right",
-                                  font=("Helvetica", 9, "bold"))
-        self.chat_box.tag_config("them",      foreground=TEXT,   justify="left")
-        self.chat_box.tag_config("them_name", foreground=GREEN,  justify="left",
-                                  font=("Helvetica", 9, "bold"))
-        self.chat_box.tag_config("system",    foreground=TEXT2,  justify="center",
-                                  font=("Helvetica", 9, "italic"))
+        # tags de cor
+        self._chat_text.tag_config("time",  foreground=FG2)
+        self._chat_text.tag_config("name",  foreground=ACCENT)
+        self._chat_text.tag_config("me",    foreground=SUCCESS)
+        self._chat_text.tag_config("sys",   foreground=FG2, font=("Courier", 9))
+        self._chat_text.tag_config("msg",   foreground=FG)
 
-        self._append_msg("Sistema",
-                         "Conectado — aguardando troca de chaves com peers…", "system")
+        # barra de entrada
+        input_bar = frame(f, bg=BG2)
+        input_bar.pack(fill="x")
+        input_bar.configure(highlightthickness=1, highlightbackground=BORDER)
 
-        input_bar = tk.Frame(chat_area, bg=BG2, height=54)
-        input_bar.pack(fill="x", side="bottom")
-        input_bar.pack_propagate(False)
+        self._msg_var = tk.StringVar()
+        msg_e = styled_entry(input_bar, textvariable=self._msg_var)
+        msg_e.pack(side="left", fill="x", expand=True,
+                   padx=(16, 8), pady=12, ipady=7)
 
-        self.msg_var = tk.StringVar()
-        self.msg_entry = tk.Entry(
-            input_bar, textvariable=self.msg_var,
-            bg=BG3, fg=TEXT, insertbackground=TEXT,
-            relief="flat", font=("Helvetica", 11),
-            highlightthickness=1, highlightcolor=ACCENT, highlightbackground=BG2)
-        self.msg_entry.pack(side="left", fill="both", expand=True,
-                             padx=(12, 6), pady=10, ipady=5)
-        self.msg_entry.bind("<Return>", lambda e: self._send())
+        def send():
+            text = self._msg_var.get().strip()
+            if not text:
+                return
+            self._msg_var.set("")
+            full = f"{self.my_name}: {text}"
+            self._append_msg(self.my_name, text, own=True)
+            threading.Thread(
+                target=broadcast,
+                args=(self.peers, self.fernet, full, self.my_name),
+                daemon=True
+            ).start()
 
-        tk.Button(input_bar, text="Enviar", bg=ACCENT, fg="white",
-                  relief="flat", cursor="hand2",
-                  font=("Helvetica", 10, "bold"), activebackground=ACCENT2,
-                  command=self._send
-                  ).pack(side="right", padx=(0, 12), pady=10, ipadx=12, ipady=5)
+        styled_button(input_bar, "Enviar", send).pack(side="right", padx=(0, 16), pady=12)
+        msg_e.bind("<Return>", lambda e: send())
+        msg_e.focus()
 
-        self.msg_entry.focus()
-        threading.Thread(target=self._receive_loop, daemon=True).start()
+        self._switch(f)
+        self._refresh_peers_sidebar()
+        self._system_msg(f"Você entrou na sala «{self.room_name}». Mensagens são criptografadas.")
 
-    def _add_peer_row(self, name, is_me=False):
-        if name in self._peer_rows:
-            return
-        row = tk.Frame(self.peers_frame, bg=BG2)
+    def _refresh_peers_sidebar(self):
+        for w in self._peers_frame.winfo_children():
+            w.destroy()
+
+        row = frame(self._peers_frame, bg=BG2)
         row.pack(fill="x", pady=2)
-        tk.Label(row, text="●", bg=BG2, fg=ACCENT if is_me else GREEN,
-                 font=("Helvetica", 8)).pack(side="left", padx=(4, 4))
-        tk.Label(row, text=name + (" (você)" if is_me else ""), bg=BG2, fg=TEXT,
-                 font=("Helvetica", 10)).pack(side="left")
-        self._peer_rows[name] = row
+        dot = tk.Label(row, text="●", bg=BG2, fg=SUCCESS, font=("Courier", 9))
+        dot.pack(side="left")
+        tk.Label(row, text=f" {self.my_name} (eu)", bg=BG2, fg=FG,
+                 font=("Helvetica", 9)).pack(side="left")
 
-    def _append_msg(self, sender, content, tag):
-        self.chat_box.config(state="normal")
-        if tag == "system":
-            self.chat_box.insert("end", f"\n  {content}\n", "system")
-        elif tag == "me":
-            self.chat_box.insert("end", f"\n{sender}  \n", "me_name")
-            self.chat_box.insert("end", f"{content}\n", "me")
+        for name in self.peers:
+            row = frame(self._peers_frame, bg=BG2)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text="●", bg=BG2, fg=ACCENT, font=("Courier", 9)).pack(side="left")
+            tk.Label(row, text=f" {name}", bg=BG2, fg=FG,
+                     font=("Helvetica", 9)).pack(side="left")
+
+    def _append_msg(self, sender: str, text: str, own=False):
+        t = time.strftime("%H:%M")
+        self._chat_text.config(state="normal")
+        self._chat_text.insert("end", f"[{t}] ", "time")
+        self._chat_text.insert("end", f"{sender}", "me" if own else "name")
+        self._chat_text.insert("end", f":  {text}\n", "msg")
+        self._chat_text.config(state="disabled")
+        self._chat_text.see("end")
+
+    def _system_msg(self, text: str):
+        self._chat_text.config(state="normal")
+        self._chat_text.insert("end", f"  ·  {text}\n", "sys")
+        self._chat_text.config(state="disabled")
+        self._chat_text.see("end")
+
+    def _on_peer_message(self, text: str):
+        # formato esperado: "nome: mensagem"
+        if ": " in text:
+            sender, msg = text.split(": ", 1)
         else:
-            self.chat_box.insert("end", f"\n{sender}\n", "them_name")
-            self.chat_box.insert("end", f"{content}\n", "them")
-        self.chat_box.config(state="disabled")
-        self.chat_box.see("end")
-
-    def _send(self):
-        content = self.msg_var.get().strip()
-        if not content:
-            return
-        self.msg_var.set("")
-        data = json.dumps({"type": "message", "from": self.my_name, "content": content})
-        sent = False
-        for pname, (ip, port) in list(self.peers.items()):
-            key = self.peer_aes.get(pname)
-            if not key:
-                continue
-            try:
-                enc = encrypt_message(key, data)
-                self.udp_sock.sendto(
-                    f"CMSG:{self.my_name}:{enc.hex()}".encode(), (ip, port))
-                sent = True
-            except Exception as e:
-                self.after(0, lambda err=e, p=pname:
-                    self._append_msg("Sistema", f"Erro ao enviar para {p}: {err}", "system"))
-        if sent:
-            self._append_msg(self.my_name, content, "me")
-        elif not self.peer_aes:
-            self._append_msg("Sistema", "Aguardando troca de chaves com os peers…", "system")
-
-    # ── Loop de recepção ──────────────────────────────────────────────────────
-
-    def _receive_loop(self):
-        self.udp_sock.settimeout(None)
-        while True:
-            try:
-                data, addr = self.udp_sock.recvfrom(65535)
-                raw = data.decode(errors="replace")
-
-                if raw in ("PUNCH", ""):
-                    continue
-
-                # Servidor notificou peers novos ou atualizados
-                if raw.startswith("PEERS:"):
-                    new_peers = []
-                    for entry in raw[len("PEERS:"):].split(";"):
-                        if not entry:
-                            continue
-                        n, ip, p = entry.split(":")
-                        if n != self.my_name and n not in self.peers:
-                            self.peers[n] = (ip, int(p))
-                            new_peers.append((n, ip, int(p)))
-                    for n, ip, p in new_peers:
-                        self.after(0, self._add_peer_row, n)
-                        self.after(0, self._append_msg, "Sistema",
-                                   f"{n} entrou na sala.", "system")
-                        send_pubkey(self.udp_sock, self.my_name, self.my_pub, [(ip, p)])
-                    continue
-
-                # Recebeu chave pública de um peer
-                if raw.startswith("PUBKEY:"):
-                    parts = raw.split(":", 2)
-                    if len(parts) != 3:
-                        continue
-                    _, sender, hex_key = parts
-                    if sender != self.my_name and sender not in self.peer_aes:
-                        try:
-                            self.peer_aes[sender] = derive_shared_key(
-                                self.priv_key, bytes.fromhex(hex_key))
-                        except Exception:
-                            continue
-                        # Registra o peer caso não esteja no dicionário ainda
-                        if sender not in self.peers:
-                            self.peers[sender] = (addr[0], addr[1])
-                        # Responde com a própria chave pública
-                        send_pubkey(self.udp_sock, self.my_name,
-                                    self.my_pub, [self.peers[sender]])
-                        self.after(0, self._add_peer_row, sender)
-                        self.after(0, self._append_msg, "Sistema",
-                                   f"🔒 Canal cifrado com {sender} estabelecido.", "system")
-                    continue
-
-                # Mensagem cifrada
-                if raw.startswith("CMSG:"):
-                    parts = raw.split(":", 2)
-                    if len(parts) != 3:
-                        continue
-                    _, sender, hex_pay = parts
-                    key = self.peer_aes.get(sender)
-                    if not key:
-                        continue
-                    try:
-                        plaintext = decrypt_message(key, bytes.fromhex(hex_pay))
-                        msg = json.loads(plaintext)
-                    except Exception:
-                        continue
-                    if msg.get("type") == "message":
-                        self.after(0, lambda m=msg: self._append_msg(
-                            m["from"], m["content"], "them"))
-
-            except Exception:
-                break
+            sender, msg = "?", text
+        self.after(0, lambda: self._append_msg(sender, msg, own=False))
 
 
+# Main
 if __name__ == "__main__":
-    app = ChatApp()
+    app = App()
     app.mainloop()
